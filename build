@@ -1,0 +1,140 @@
+#!/usr/bin/env bash
+# build - builds all assets declared in build-plan.yaml and writes build-output.yaml
+#
+# Usage: build [REPO_DIR]
+#   REPO_DIR  path to the repository root (default: current directory)
+#
+# Reads:   REPO_DIR/build-plan.yaml
+# Writes:  REPO_DIR/build-output.yaml
+#
+# Requires: yq >= 4 (https://github.com/mikefarah/yq)
+#           rockcraft / snapcraft / charmcraft (only the ones needed by the plan)
+
+set -euo pipefail
+
+REPO_DIR="${1:-.}"
+REPO_DIR="$(realpath "$REPO_DIR")"
+PLAN="$REPO_DIR/build-plan.yaml"
+OUTPUT="$REPO_DIR/build-output.yaml"
+
+# --- helpers -----------------------------------------------------------------
+
+die()  { echo "error: $*" >&2; exit 1; }
+info() { echo "$*" >&2; }
+
+command -v yq >/dev/null 2>&1 || die "yq is required. Install with: snap install yq"
+[[ -f "$PLAN" ]] || die "build-plan.yaml not found in $REPO_DIR — run generate-plan first"
+
+# Find a single produced file matching a glob pattern inside a directory.
+# Fails if zero or more than one match is found.
+find_one() {
+    local dir="$1" pattern="$2" label="$3"
+    local -a files
+    mapfile -t files < <(find "$dir" -maxdepth 1 -name "$pattern" | sort)
+    [[ ${#files[@]} -eq 0 ]] && die "no $label file found in $dir matching '$pattern'"
+    echo "${files[@]}"   # may be multiple (e.g. multi-base charms)
+}
+
+# --- read plan ---------------------------------------------------------------
+
+rock_count=$(yq  '.rocks  | length' "$PLAN" 2>/dev/null || echo 0)
+snap_count=$(yq  '.snaps  | length' "$PLAN" 2>/dev/null || echo 0)
+charm_count=$(yq '.charms | length' "$PLAN" 2>/dev/null || echo 0)
+
+info "Plan: $rock_count rock(s), $snap_count snap(s), $charm_count charm(s)"
+
+# Start output file as a copy of the plan; we will add .output fields in-place
+cp "$PLAN" "$OUTPUT"
+
+# --- build rocks -------------------------------------------------------------
+
+for i in $(seq 0 $((rock_count - 1))); do
+    name=$(yq   ".rocks[$i].name"   "$PLAN")
+    source=$(yq ".rocks[$i].source" "$PLAN")
+    abs_dir="$REPO_DIR/$source"
+
+    info ""
+    info "Building rock: $name ($source)"
+    command -v rockcraft >/dev/null 2>&1 || die "rockcraft not found (needed for rock '$name')"
+
+    (cd "$abs_dir" && rockcraft pack --verbosity brief)
+
+    # Find produced .rock file(s)
+    mapfile -t rock_files < <(find_one "$abs_dir" "*.rock" "rock")
+    # Use the first file (single-arch local builds produce one)
+    rock_file="${rock_files[0]}"
+    rel_rock_file="$(realpath --relative-to="$REPO_DIR" "$rock_file")"
+
+    info "  produced: $rel_rock_file"
+    yq -i ".rocks[$i].output.file = \"$rel_rock_file\"" "$OUTPUT"
+done
+
+# --- build snaps -------------------------------------------------------------
+
+for i in $(seq 0 $((snap_count - 1))); do
+    name=$(yq   ".snaps[$i].name"   "$PLAN")
+    source=$(yq ".snaps[$i].source" "$PLAN")
+    abs_dir="$REPO_DIR/$source"
+
+    info ""
+    info "Building snap: $name ($source)"
+    command -v snapcraft >/dev/null 2>&1 || die "snapcraft not found (needed for snap '$name')"
+
+    (cd "$abs_dir" && snapcraft pack --verbosity brief)
+
+    mapfile -t snap_files < <(find_one "$abs_dir" "*.snap" "snap")
+    snap_file="${snap_files[0]}"
+    rel_snap_file="$(realpath --relative-to="$REPO_DIR" "$snap_file")"
+
+    info "  produced: $rel_snap_file"
+    yq -i ".snaps[$i].output.file = \"$rel_snap_file\"" "$OUTPUT"
+done
+
+# --- build charms ------------------------------------------------------------
+
+for i in $(seq 0 $((charm_count - 1))); do
+    name=$(yq   ".charms[$i].name"   "$PLAN")
+    source=$(yq ".charms[$i].source" "$PLAN")
+    abs_dir="$REPO_DIR/$source"
+
+    info ""
+    info "Building charm: $name ($source)"
+    command -v charmcraft >/dev/null 2>&1 || die "charmcraft not found (needed for charm '$name')"
+
+    (cd "$abs_dir" && charmcraft pack --verbosity brief)
+
+    # Charms can produce multiple .charm files (one per base)
+    mapfile -t charm_files < <(find_one "$abs_dir" "*.charm" "charm")
+    rel_charm_files=()
+    for cf in "${charm_files[@]}"; do
+        rel_charm_files+=("$(realpath --relative-to="$REPO_DIR" "$cf")")
+        info "  produced: $(realpath --relative-to="$REPO_DIR" "$cf")"
+    done
+
+    # Write output.files as a YAML list
+    files_yaml="["
+    for cf in "${rel_charm_files[@]}"; do
+        files_yaml+="\"$cf\","
+    done
+    files_yaml="${files_yaml%,}]"   # strip trailing comma
+    yq -i ".charms[$i].output.files = $files_yaml" "$OUTPUT"
+
+    # Resolve resource outputs from their rock's output
+    res_count=$(yq ".charms[$i].resources | length" "$PLAN" 2>/dev/null || echo 0)
+    for j in $(seq 0 $((res_count - 1))); do
+        res_name=$(yq ".charms[$i].resources | keys | .[$j]" "$PLAN")
+        res_type=$(yq ".charms[$i].resources.\"$res_name\".type" "$PLAN")
+
+        if [[ "$res_type" == "oci-image" ]]; then
+            rock_ref=$(yq ".charms[$i].resources.\"$res_name\".rock" "$PLAN")
+            # Find the rock's output in the plan
+            rock_file_out=$(yq ".rocks[] | select(.name == \"$rock_ref\") | .output.file" "$OUTPUT" 2>/dev/null || true)
+            if [[ -n "$rock_file_out" && "$rock_file_out" != "null" ]]; then
+                yq -i ".charms[$i].resources.\"$res_name\".output.file = \"$rock_file_out\"" "$OUTPUT"
+            fi
+        fi
+    done
+done
+
+info ""
+info "Written: $OUTPUT"

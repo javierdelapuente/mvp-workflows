@@ -1,0 +1,77 @@
+#!/usr/bin/env bash
+# test - provisions the environment and runs integration tests
+#
+# Usage: test [REPO_DIR]
+#   REPO_DIR  path to the repository root (default: current directory)
+#
+# Reads:   REPO_DIR/build-output.yaml  (produced by the build script)
+#          REPO_DIR/concierge.yaml      (optional: if present, runs concierge prepare)
+#
+# Requires: yq >= 4, tox (or uv), concierge (optional)
+
+set -euo pipefail
+
+REPO_DIR="${1:-.}"
+REPO_DIR="$(realpath "$REPO_DIR")"
+OUTPUT="$REPO_DIR/build-output.yaml"
+
+# --- helpers -----------------------------------------------------------------
+
+die()  { echo "error: $*" >&2; exit 1; }
+info() { echo "$*" >&2; }
+
+command -v yq  >/dev/null 2>&1 || die "yq is required. Install with: snap install yq"
+command -v tox >/dev/null 2>&1 || die "tox is required. Install with: pip install tox"
+[[ -f "$OUTPUT" ]] || die "build-output.yaml not found in $REPO_DIR — run build first"
+
+# --- provision ---------------------------------------------------------------
+
+if [[ -f "$REPO_DIR/concierge.yaml" ]]; then
+    info "concierge.yaml found — provisioning environment..."
+    command -v concierge >/dev/null 2>&1 || die "concierge not found. Install with: sudo snap install --classic concierge"
+    (cd "$REPO_DIR" && sudo concierge prepare)
+else
+    info "No concierge.yaml found — skipping provisioning (assuming environment is ready)"
+fi
+
+# --- assemble pytest posargs from build-output.yaml --------------------------
+
+args=()
+
+charm_count=$(yq '.charms | length' "$OUTPUT" 2>/dev/null || echo 0)
+
+for i in $(seq 0 $((charm_count - 1))); do
+    # charm files → --charm-file args
+    files_count=$(yq ".charms[$i].output.files | length" "$OUTPUT" 2>/dev/null || echo 0)
+    for j in $(seq 0 $((files_count - 1))); do
+        charm_file=$(yq ".charms[$i].output.files[$j]" "$OUTPUT")
+        # keep as relative path (tox runs from REPO_DIR; pytest_operator prefixes ./)
+        if [[ "$charm_file" == /* ]]; then
+            charm_file="$(realpath --relative-to="$REPO_DIR" "$charm_file")"
+        fi
+        args+=("--charm-file=$charm_file")
+    done
+
+    # OCI image resources → --<resource-name>-image args (or --<resource>)
+    res_count=$(yq ".charms[$i].resources | length" "$OUTPUT" 2>/dev/null || echo 0)
+    if [[ "$res_count" -gt 0 ]]; then
+        mapfile -t res_names < <(yq ".charms[$i].resources | keys | .[]" "$OUTPUT" 2>/dev/null || true)
+        for res_name in "${res_names[@]:-}"; do
+            [[ -z "${res_name:-}" ]] && continue
+            res_type=$(yq ".charms[$i].resources.\"$res_name\".type" "$OUTPUT")
+            if [[ "$res_type" == "oci-image" ]]; then
+                image=$(yq ".charms[$i].resources.\"$res_name\".output.image // .charms[$i].resources.\"$res_name\".output.file" "$OUTPUT")
+                [[ -z "$image" || "$image" == "null" ]] && continue
+                args+=("--${res_name}=$image")
+            fi
+        done
+    fi
+done
+
+info ""
+info "Running: tox -e integration -- ${args[*]:-}"
+info ""
+
+# --- run integration tests ---------------------------------------------------
+
+(cd "$REPO_DIR" && tox -e integration -- "${args[@]:-}")

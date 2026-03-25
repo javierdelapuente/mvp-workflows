@@ -1,0 +1,152 @@
+#!/usr/bin/env bash
+# generate-plan - auto-generates build-plan.yaml from a charm repository
+#
+# Usage: generate-plan [REPO_DIR]
+#   REPO_DIR  path to the repository root (default: current directory)
+#
+# Requires: yq >= 4 (https://github.com/mikefarah/yq)
+#   Install: snap install yq
+
+set -euo pipefail
+
+REPO_DIR="${1:-.}"
+REPO_DIR="$(realpath "$REPO_DIR")"
+OUTPUT="$REPO_DIR/build-plan.yaml"
+
+# --- helpers -----------------------------------------------------------------
+
+die()  { echo "error: $*" >&2; exit 1; }
+warn() { echo "warn: $*"  >&2; }
+info() { echo "$*"        >&2; }
+
+command -v yq >/dev/null 2>&1 || die "yq is required. Install with: snap install yq"
+
+# Return path relative to REPO_DIR; normalise bare "." to "."
+rel() { realpath --relative-to="$REPO_DIR" "$1" || echo "."; }
+
+# Read .name from a YAML file; returns empty string if absent
+yaml_name() { yq '.name // ""' "$1" 2>/dev/null || true; }
+
+# --- discovery ---------------------------------------------------------------
+
+info "Scanning $REPO_DIR ..."
+
+mapfile -t rock_files  < <(find "$REPO_DIR" -name 'rockcraft.yaml'  -not -path '*/tests/*' -not -path '*/.git/*' | sort)
+mapfile -t snap_files  < <(find "$REPO_DIR" -name 'snapcraft.yaml'  -not -path '*/tests/*' -not -path '*/.git/*' | sort)
+mapfile -t charm_files < <(find "$REPO_DIR" -name 'charmcraft.yaml' -not -path '*/tests/*' -not -path '*/.git/*' | sort)
+
+# Build rock name -> relative source dir map (used for charm resource matching)
+declare -A rock_source_by_name
+for f in "${rock_files[@]:-}"; do
+    [[ -z "${f:-}" ]] && continue
+    name="$(yaml_name "$f")"
+    [[ -z "$name" ]] && { warn "no name in $f — skipping"; continue; }
+    src="$(rel "$(dirname "$f")")"
+    rock_source_by_name["$name"]="$src"
+    info "  rock:  $name  ($src)"
+done
+
+# --- write build-plan.yaml ---------------------------------------------------
+
+{
+    echo "version: 1"
+
+    # rocks
+    has_rocks=false
+    for f in "${rock_files[@]:-}"; do
+        [[ -z "${f:-}" ]] && continue
+        name="$(yaml_name "$f")"
+        [[ -z "$name" ]] && continue
+        if ! $has_rocks; then
+            echo ""
+            echo "rocks:"
+            has_rocks=true
+        fi
+        src="$(rel "$(dirname "$f")")"
+        echo "  - name: $name"
+        echo "    source: $src"
+    done
+
+    # snaps
+    has_snaps=false
+    for f in "${snap_files[@]:-}"; do
+        [[ -z "${f:-}" ]] && continue
+        name="$(yaml_name "$f")"
+        [[ -z "$name" ]] && { warn "no name in $f — skipping"; continue; }
+        if ! $has_snaps; then
+            echo ""
+            echo "snaps:"
+            has_snaps=true
+        fi
+        src="$(rel "$(dirname "$f")")"
+        echo "  - name: $name"
+        echo "    source: $src"
+        info "  snap:  $name  ($src)"
+    done
+
+    # charms
+    has_charms=false
+    for f in "${charm_files[@]:-}"; do
+        [[ -z "${f:-}" ]] && continue
+        dir="$(dirname "$f")"
+
+        # charm name: charmcraft.yaml first, fall back to metadata.yaml
+        name="$(yaml_name "$f")"
+        if [[ -z "$name" && -f "$dir/metadata.yaml" ]]; then
+            name="$(yaml_name "$dir/metadata.yaml")"
+        fi
+        [[ -z "$name" ]] && { warn "no name in $f — skipping"; continue; }
+
+        if ! $has_charms; then
+            echo ""
+            echo "charms:"
+            has_charms=true
+        fi
+
+        src="$(rel "$dir")"
+        echo "  - name: $name"
+        echo "    source: $src"
+        info "  charm: $name  ($src)"
+
+        # OCI image resources without upstream-source
+        # try charmcraft.yaml first, then metadata.yaml
+        resources_file="$f"
+        res_count=$(yq '.resources | length' "$resources_file" 2>/dev/null || echo 0)
+        if [[ "$res_count" -eq 0 && -f "$dir/metadata.yaml" ]]; then
+            resources_file="$dir/metadata.yaml"
+            res_count=$(yq '.resources | length' "$resources_file" 2>/dev/null || echo 0)
+        fi
+
+        if [[ "$res_count" -gt 0 ]]; then
+            mapfile -t oci_resources < <(
+                yq '.resources // {} | to_entries[] |
+                    select(.value.type == "oci-image") |
+                    select(.value."upstream-source" == null) |
+                    .key' "$resources_file" 2>/dev/null || true
+            )
+            if [[ ${#oci_resources[@]} -gt 0 && -n "${oci_resources[0]:-}" ]]; then
+                echo "    resources:"
+                for resource in "${oci_resources[@]}"; do
+                    [[ -z "${resource:-}" ]] && continue
+                    # convention: "foo-image" -> rock "foo"
+                    rock_name="${resource%-image}"
+                    if [[ -n "${rock_source_by_name[$rock_name]:-}" ]]; then
+                        echo "      $resource:"
+                        echo "        type: oci-image"
+                        echo "        rock: $rock_name"
+                    else
+                        echo "      # TODO: could not match '$resource' to a discovered rock"
+                        echo "      # $resource:"
+                        echo "      #   type: oci-image"
+                        echo "      #   rock: ???"
+                        warn "could not match resource '$resource' in charm '$name' to any rock"
+                    fi
+                done
+            fi
+        fi
+    done
+
+} > "$OUTPUT"
+
+info ""
+info "Written: $OUTPUT"
