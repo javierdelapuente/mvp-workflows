@@ -25,7 +25,7 @@ jobs:
           path: .mvp-workflows
 
       - name: Install yq
-        run: sudo snap install yq
+        run: sudo apt-get install -y yq
 
       - name: Generate build plan
         id: plan
@@ -78,12 +78,12 @@ jobs:
 
       - name: Install tools
         run: |
-          sudo snap install yq
+          sudo apt-get install -y yq
           sudo snap install charmcraft --classic
           sudo snap install rockcraft --classic
 
       - name: Build
-        run: .mvp-workflows/build .
+        run: sg lxd .mvp-workflows/build .
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
