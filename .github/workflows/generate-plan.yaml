@@ -76,7 +76,7 @@ jobs:
 
       - name: Install tools
         run: |
-          sudo apt-get install -y yq
+          sudo snap install yq
           sudo snap install charmcraft --classic
           sudo snap install rockcraft --classic
 
