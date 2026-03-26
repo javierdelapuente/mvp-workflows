@@ -61,8 +61,8 @@ jobs:
 
       - name: Set up LXD
         run: |
-          echo "==> Refreshing LXD snap"
-          sudo snap refresh lxd
+          echo "==> Installing LXD snap"
+          sudo snap install lxd --channel=latest/stable
           echo "==> Waiting for LXD daemon"
           sudo lxd waitready --timeout=60
           echo "==> Initialising LXD"
