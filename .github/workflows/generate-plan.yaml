@@ -61,6 +61,8 @@ jobs:
 
       - name: Set up LXD
         run: |
+          echo "==> Waiting for snap seed"
+          sudo snap wait system seed.loaded
           echo "==> Installing LXD snap"
           sudo snap install lxd --channel=latest/stable
           echo "==> Waiting for LXD daemon"
@@ -77,6 +79,7 @@ jobs:
       - name: Install tools
         run: |
           sudo apt-get install -y yq
+          sudo snap wait system seed.loaded
           sudo snap install charmcraft --classic
           sudo snap install rockcraft --classic
 
