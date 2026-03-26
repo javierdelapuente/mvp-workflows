@@ -1,4 +1,4 @@
-name: Generate plan
+name: Generate plan and build
 
 on:
   workflow_call:
@@ -37,3 +37,44 @@ jobs:
         with:
           name: build-plan
           path: build-plan.yaml
+
+  build:
+    name: Build
+    needs: generate-plan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout caller repository
+        uses: actions/checkout@v4
+
+      - name: Checkout mvp-workflows
+        uses: actions/checkout@v4
+        with:
+          repository: javierdelapuente/mvp-workflows
+          path: .mvp-workflows
+
+      - name: Download build-plan.yaml
+        uses: actions/download-artifact@v4
+        with:
+          name: build-plan
+
+      - name: Set up LXD
+        uses: canonical/setup-lxd@v0.1.3
+
+      - name: Install tools
+        run: |
+          sudo snap install yq
+          sudo snap install charmcraft --classic
+          sudo snap install rockcraft --classic
+
+      - name: Build
+        run: .mvp-workflows/build .
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-output
+          path: |
+            build-output.yaml
+            **/*.charm
+            **/*.rock
+          if-no-files-found: warn
