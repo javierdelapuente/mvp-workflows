@@ -61,18 +61,18 @@ jobs:
 
       - name: Set up LXD
         run: |
-          if ! snap list lxd 2>/dev/null; then
-            sudo snap install lxd --channel=latest/stable
-          fi
-          sudo lxd waitready
+          echo "==> Refreshing LXD snap"
+          sudo snap refresh lxd
+          echo "==> Waiting for LXD daemon"
+          sudo lxd waitready --timeout=60
+          echo "==> Initialising LXD"
           sudo lxd init --auto
           sudo lxc config set images.compression_algorithm none
-          # Allow LXD bridge traffic through the Docker firewall chain (if present)
-          if sudo iptables -nL DOCKER-USER 2>/dev/null; then
-            sudo iptables -I DOCKER-USER -i lxdbr0 -j ACCEPT
-            sudo iptables -I DOCKER-USER -o lxdbr0 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
-          fi
+          echo "==> Configuring firewall"
+          sudo iptables -I DOCKER-USER -i lxdbr0 -j ACCEPT 2>/dev/null || true
+          sudo iptables -I DOCKER-USER -o lxdbr0 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
           sudo adduser "$USER" lxd
+          echo "==> LXD setup complete"
 
       - name: Install tools
         run: |
