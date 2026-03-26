@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# provision - provisions the environment for integration testing
+#
+# Usage: provision [REPO_DIR]
+#   REPO_DIR  path to the repository root (default: current directory)
+#
+# If concierge.yaml exists in REPO_DIR, runs `sudo concierge prepare`.
+# Otherwise, assumes the environment is already ready and continues.
+#
+# Requires: concierge (if concierge.yaml is present)
+#   Install with: sudo snap install --classic concierge
+
+set -euo pipefail
+
+REPO_DIR="${1:-.}"
+REPO_DIR="$(realpath "$REPO_DIR")"
+
+die()  { echo "error: $*" >&2; exit 1; }
+info() { echo "$*" >&2; }
+
+if [[ -f "$REPO_DIR/concierge.yaml" ]]; then
+    info "concierge.yaml found — provisioning environment..."
+    command -v concierge >/dev/null 2>&1 || die "concierge not found. Install with: sudo snap install --classic concierge"
+    (cd "$REPO_DIR" && sudo concierge prepare)
+else
+    info "No concierge.yaml found — skipping provisioning (assuming environment is ready)"
+fi

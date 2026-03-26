@@ -557,3 +557,352 @@ charms:
 ### Next
 
 - [ ] Test against `github-runner-operators` (monorepo, 2× 12-factor charms)
+
+---
+
+## Tool Design: Four Scripts
+
+```
+generate-plan   reads repo → writes build-plan.yaml
+build           reads build-plan.yaml → builds assets → writes build-output.yaml
+provision       reads concierge.yaml → runs concierge prepare
+wait-build      (CI only) polls GitHub API → waits for build jobs → downloads build-output.yaml
+test            reads build-output.yaml → runs tox -e integration [--module X]
+```
+
+### Local workflow
+```bash
+./generate-plan .
+./build .
+./provision .
+./test . [--module test_charm.py]
+```
+
+### CI workflow (parallel build + provision)
+```
+Job A (build):   ./build  →  upload build-output.yaml artifact
+Job B (test):    ./provision
+                 ./wait-build        ← blocks until Job A done, downloads build-output.yaml
+                 ./test --module X
+```
+
+Both jobs start simultaneously. Provisioning and building overlap.
+`wait-build` is the synchronisation point.
+
+### provision script
+- If `concierge.yaml` exists in repo: `sudo concierge prepare`
+- Otherwise: warn and continue (assume environment already ready)
+
+### wait-build script (CI only)
+- Uses `gh` CLI (available on all GitHub-hosted runners)
+- Polls `GET /repos/:repo/actions/runs/:run_id/jobs` every 10s
+- Finds jobs whose names contain `/ Build` with matching prefix
+- Waits for all to reach `conclusion: success`
+- Downloads `build-output` artifact to current directory
+- Fails if any build job fails
+
+### test script
+- Reads `build-output.yaml`
+- Assembles pytest posargs: `--charm-file`, `--<resource>=<image>`
+- Accepts optional `--module <file>` flag → passes `-k <file>` to pytest
+- Runs `tox -e integration -- <posargs>`
+
+### Open questions
+- [ ] Where does the modules list live for CI matrix fan-out? (`test-plan.yaml`? workflow call-site? → probably spread.yaml itself)
+- [x] Spread: decided — see section below
+
+---
+
+## Spread Integration Design
+
+### Core idea: spread.yaml as single source of truth
+
+`spread.yaml` lives in the repo and defines the test modules as **variants**. It drives:
+- **Local parallel testing** via `spread lxdvm:` (N VMs in parallel)
+- **CI matrix generation** — GitHub Actions parses `spread.yaml` to build the matrix dynamically
+- **CI test execution** — each matrix job runs `spread ci: integration/test:$MODULE`
+
+Adding a new test module = add a variant to `spread.yaml`. Both local and CI pick it up automatically. No separate module list to maintain.
+
+### Mandatory or optional?
+
+**Optional** — repos with **one module** use `provision → test` directly and don't need `spread.yaml`. Repos with **multiple modules** commit `spread.yaml`.
+
+### Two backends
+
+```
+lxdvm    allocates a fresh LXD VM per worker (lxc launch --vm)
+         VMs are full machines → Juju/LXD runs natively, no nesting
+         workers: N → N VMs in parallel
+         used for: local parallel dev
+
+ci       makes the current machine available to spread via SSH (root + password)
+         no new VM allocated — spread SSHes to localhost
+         workers: 1 (the runner IS the machine, already provisioned)
+         used for: each CI matrix job
+```
+
+Learned from charmcraft's spread setup: they use the same two-backend pattern with a `.extension` shell script that implements `allocate/discard/backend-prepare/backend-restore` hooks.
+
+### spread.yaml for indico-operator
+
+```yaml
+# spread.yaml (at repo root)
+project: indico-operator
+
+backends:
+  lxdvm:
+    type: adhoc
+    allocate: HOST:.extension allocate lxd-vm
+    discard:  HOST:.extension discard lxd-vm
+    prepare:  HOST:.extension backend-prepare
+    restore:  HOST:.extension backend-restore
+    systems:
+      - ubuntu-22.04:
+          workers: 5           # N VMs = N modules, for local parallel run
+  ci:
+    type: adhoc
+    allocate: HOST:.extension allocate ci
+    discard:  HOST:.extension discard ci
+    prepare:  HOST:.extension backend-prepare
+    restore:  HOST:.extension backend-restore
+    systems:
+      - ubuntu-22.04:
+          workers: 1
+
+path: /root/project
+
+suites:
+  integration/:
+    summary: Integration tests
+    environment:
+      MODULE/test_actions: test_actions
+      MODULE/test_charm:   test_charm
+      MODULE/test_loki:    test_loki
+      MODULE/test_s3:      test_s3
+      MODULE/test_saml:    test_saml
+    prepare: |
+      ./provision .            # runs ONCE per worker (not per variant)
+```
+
+```yaml
+# integration/task.yaml
+summary: Run $MODULE integration test
+kill-timeout: 90m
+execute: |
+  ./test . --module $MODULE
+```
+
+### CI workflow driven by spread.yaml
+
+```
+Job A (build):
+  ./build → upload build-output artifact
+
+Job generate-matrix:
+  parse spread.yaml → extract variant names → output JSON array
+  → drives strategy.matrix for Job B
+
+Job B × N (test):      ← one per variant in spread.yaml
+  ./provision
+  ./wait-build         ← downloads build-output.yaml
+  spread ci: integration/test:$MODULE
+```
+
+`spread ci:` SSHes to localhost (the runner itself), copies the project (including `build-output.yaml`
+downloaded by `wait-build`), and runs `./test . --module $MODULE` there.
+
+**`wait-build` is still needed** — build and test jobs start simultaneously. `wait-build`
+synchronises them (downloads `build-output.yaml` artifact once build completes).
+
+### Reading modules from spread.yaml in GitHub Actions
+
+```yaml
+- name: Extract test modules
+  id: modules
+  run: |
+    modules=$(yq '.suites["integration/"].environment | keys | .[]
+                  | select(startswith("MODULE/")) | ltrimstr("MODULE/")' spread.yaml               | jq -R . | jq -sc .)
+    echo "matrix=$modules" >> $GITHUB_OUTPUT
+```
+
+This produces e.g. `["test_actions","test_charm","test_loki","test_s3","test_saml"]`
+which feeds `strategy.matrix.module`.
+
+### No external script: generate-spread writes self-contained spread.yaml
+
+We do **not** put a `.extension` file in each repo. Instead, a `generate-spread` tool writes a
+**fully self-contained `spread.yaml`** with all allocate/discard/prepare/restore scripts embedded
+inline (spread's `adhoc` backend supports this). Repos commit only `spread.yaml` + `integration/task.yaml`.
+
+When the backend logic changes, teams re-run `./generate-spread .` to refresh their `spread.yaml`.
+The generator is the single source of truth. The generated file is committed and stable.
+
+```yaml
+# spread.yaml — generated by ./generate-spread, then committed
+project: indico-operator
+
+backends:
+  lxdvm:
+    type: adhoc
+    allocate: |
+      # inline: create LXD VM and print its IP to fd 3
+      VM_NAME="spread-lxdvm-${RANDOM}"
+      lxc launch --vm ubuntu:22.04 "$VM_NAME" \
+          -c limits.cpu=4 -c limits.memory=8GiB -d root,size=20GiB
+      while ! lxc exec "$VM_NAME" -- true &>/dev/null; do sleep 0.5; done
+      lxc exec "$VM_NAME" -- sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config
+      echo "root:$SPREAD_PASSWORD" | lxc exec "$VM_NAME" -- chpasswd
+      ADDR=""
+      while [ -z "$ADDR" ]; do
+          ADDR=$(lxc ls -f csv | grep "^$VM_NAME" | cut -d, -f3 | cut -d' ' -f1)
+      done
+      echo "$ADDR" >&3
+    discard: |
+      instance=$(lxc ls -f csv | grep ",$SPREAD_SYSTEM_ADDRESS " | cut -f1 -d,)
+      lxc delete -f "$instance"
+    prepare: |
+      snap wait system seed.loaded
+      snap refresh --hold
+    restore: |
+      rm -rf "$SPREAD_PATH"
+      mkdir -p "$SPREAD_PATH"
+    systems:
+      - ubuntu-22.04:
+          workers: 5
+  ci:
+    type: adhoc
+    allocate: |
+      # inline: make this CI runner accessible via SSH
+      sudo sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config
+      sudo systemctl restart ssh
+      echo "root:$SPREAD_PASSWORD" | sudo chpasswd
+      echo localhost >&3
+    discard: |
+      true
+    prepare: |
+      snap wait system seed.loaded
+    restore: |
+      true
+    systems:
+      - ubuntu-22.04:
+          workers: 1
+
+path: /root/project
+
+suites:
+  integration/:
+    summary: Integration tests
+    environment:
+      MODULE/test_actions: test_actions
+      MODULE/test_charm:   test_charm
+      MODULE/test_loki:    test_loki
+      MODULE/test_s3:      test_s3
+      MODULE/test_saml:    test_saml
+    prepare: |
+      ./provision .
+```
+
+### generate-spread tool
+
+```
+./generate-spread [REPO_DIR]
+```
+
+**Scaffold-once** behaviour:
+- If `spread.yaml` already exists → **do nothing** (exit 0, print a notice)
+- If `spread.yaml` does not exist → generate it from the test module list
+- Same for `integration/task.yaml`
+
+This means `generate-spread` is a one-time scaffold. After that, the team owns `spread.yaml`
+and can add/remove variants or tweak backend options freely. It is hand-editable once committed.
+
+Module discovery (used only on first run):
+- Globs `tests/integration/test_*.py`, sorts, strips the `.py` extension
+
+### Files per repo
+
+```
+spread.yaml             # scaffolded by generate-spread, then hand-maintained
+integration/
+  task.yaml             # scaffolded by generate-spread, then hand-editable
+```
+
+No `.extension`, no symlinks, no external dependencies at runtime.
+
+### Local workflow (multi-module)
+
+```bash
+./generate-plan .
+./build .              # produces build-output.yaml + .charm in repo root
+spread lxdvm:          # allocates N VMs in parallel, provisions each, runs all modules
+```
+
+Single module locally (no spread needed):
+```bash
+./provision .
+./test . --module test_charm
+```
+
+### Revised workflow picture
+
+```
+Local (single module, no spread):
+  generate-plan → build → provision → test --module X
+
+Local (all modules, parallel):
+  generate-plan → build → spread lxdvm:
+  (spread: N VMs × N variants → provision + test --module X each)
+
+CI (GH Actions matrix, driven by spread.yaml):
+  Job A (build):           build → upload artifact
+  Job generate-matrix:     parse spread.yaml variants → output module list
+  Job B × N (test):        provision → wait-build → spread ci: integration/test:$MODULE
+```
+
+---
+
+## Session 3 — Spread Integration & LXD VM End-to-End Testing
+
+### What was built
+
+Five bash tools in `mvp-workflows/`:
+
+| Tool | Purpose |
+|------|---------|
+| `generate-plan` | Reads `charmcraft.yaml`/`rockcraft.yaml`, writes `build-plan.yaml` |
+| `build` | Builds rocks/charms per plan, writes `build-output.yaml`, pushes rocks to `localhost:32000` |
+| `provision` | Runs `concierge prepare` for local use |
+| `test` | Reads `build-output.yaml`, assembles pytest args, runs `tox -e integration` |
+| `generate-spread` | Scaffolds `spread.yaml` + `integration/run/task.yaml` (once only) |
+
+### Spread design
+
+- `lxdvm` backend: real LXD VMs (`lxc launch --vm`), 3 workers, 8GiB RAM, 20GiB disk
+- `ci` backend: runs on the GitHub Actions runner itself (no allocation)
+- Suite prepare: self-contained — installs concierge, bootstraps Juju/microk8s, installs tox
+- Task execute: self-contained — reads `build-output.yaml` with Python, pushes rocks to registry if needed, runs tox
+- Variants: one per test module (e.g. `MODULE/test_charm: test_charm`)
+
+### Key fixes discovered during testing
+
+1. **SSH**: Ubuntu 22.04 VM overrides sshd config via `/etc/ssh/sshd_config.d/60-cloudimg-settings.conf` — must write `PasswordAuthentication yes` there explicitly
+2. **ADDRESS API**: spread adhoc allocate uses `ADDRESS "$IP"` bash function (not `echo ADDRESS=$IP`)
+3. **Self-contained tasks**: suite prepare/task execute can't call `../mvp-workflows/provision` since spread only packs the charm repo dir; logic is inlined instead
+4. **concierge**: must pass `-c "$SPREAD_PATH/concierge.yaml"` explicitly; without it falls back to `dev` preset
+5. **tox on Ubuntu 22.04**: `pip3 install tox tox-uv` (no `--break-system-packages` on older pip)
+6. **pytest args**: charm via `--charm-file=<path>`, resources via `--<resource-name>=<ref>` (not `--resource`)
+7. **MetalLB**: indico needs `microk8s enable metallb:"${NET_PREFIX}.200-${NET_PREFIX}.210"` (dynamic subnet from VM IP)
+
+### Results
+
+| Repo | `spread lxdvm:` | Notes |
+|------|----------------|-------|
+| pollen-operator | ✅ PASSED | Machine charm, LXD-in-LXD-VM |
+| indico-operator | ⚠️ tooling OK, test OOM | k8s charm + full stack needs >8GiB RAM |
+
+### Known limitations / next steps
+
+- `wait-build` script (CI: polls GitHub API until charm/rock builds finish) — not yet implemented
+- indico `test_charm` needs a larger VM (>8GiB) due to full k8s stack resource usage
+- `generate-spread` does not regenerate if `spread.yaml` already exists (intentional scaffold-once)

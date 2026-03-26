@@ -1,17 +1,41 @@
 #!/usr/bin/env bash
-# test - provisions the environment and runs integration tests
+# test - runs integration tests using the built assets in build-output.yaml
 #
-# Usage: test [REPO_DIR]
-#   REPO_DIR  path to the repository root (default: current directory)
+# Usage: test [REPO_DIR] [--module MODULE]
+#   REPO_DIR         path to the repository root (default: current directory)
+#   --module MODULE  run only this test module file (e.g. test_charm.py)
+#                    if omitted, all integration tests are run
 #
 # Reads:   REPO_DIR/build-output.yaml  (produced by the build script)
-#          REPO_DIR/concierge.yaml      (optional: if present, runs concierge prepare)
 #
-# Requires: yq >= 4, tox (or uv), concierge (optional)
+# Requires: yq >= 4, tox
+#   Install: snap install yq && pip install tox tox-uv
+#
+# OCI images:
+#   If a resource has output.image pointing to localhost:32000 but the image is
+#   not present there (e.g. inside a fresh spread VM), the script will push the
+#   rock file (output.file on the rock) to the registry before running tests.
 
 set -euo pipefail
 
-REPO_DIR="${1:-.}"
+REPO_DIR="."
+MODULE=""
+
+# --- argument parsing --------------------------------------------------------
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --module)
+            MODULE="$2"; shift 2 ;;
+        --module=*)
+            MODULE="${1#--module=}"; shift ;;
+        -*)
+            echo "error: unknown option $1" >&2; exit 1 ;;
+        *)
+            REPO_DIR="$1"; shift ;;
+    esac
+done
+
 REPO_DIR="$(realpath "$REPO_DIR")"
 OUTPUT="$REPO_DIR/build-output.yaml"
 
@@ -24,15 +48,42 @@ command -v yq  >/dev/null 2>&1 || die "yq is required. Install with: snap instal
 command -v tox >/dev/null 2>&1 || die "tox is required. Install with: pip install tox"
 [[ -f "$OUTPUT" ]] || die "build-output.yaml not found in $REPO_DIR — run build first"
 
-# --- provision ---------------------------------------------------------------
+# Push a rock file to localhost:32000 if the image is not already present.
+# Prints the final image reference to stdout.
+ensure_local_image() {
+    local image_ref="$1" rock_name="$2"
 
-if [[ -f "$REPO_DIR/concierge.yaml" ]]; then
-    info "concierge.yaml found — provisioning environment..."
-    command -v concierge >/dev/null 2>&1 || die "concierge not found. Install with: sudo snap install --classic concierge"
-    (cd "$REPO_DIR" && sudo concierge prepare)
-else
-    info "No concierge.yaml found — skipping provisioning (assuming environment is ready)"
-fi
+    # Only handle localhost:32000 refs; others are used as-is
+    if [[ "$image_ref" != localhost:32000/* ]]; then
+        echo "$image_ref"; return
+    fi
+
+    # Check if image already exists in registry
+    local name_tag="${image_ref#localhost:32000/}"
+    if curl -sf --max-time 3 "http://localhost:32000/v2/${name_tag%%:*}/manifests/${name_tag##*:}" \
+           -H "Accept: application/vnd.oci.image.manifest.v1+json" >/dev/null 2>&1; then
+        echo "$image_ref"; return
+    fi
+
+    # Image not present — find the rock file and push it
+    local rock_file
+    rock_file=$(yq ".rocks[] | select(.name == \"$rock_name\") | .output.file" "$OUTPUT" 2>/dev/null || true)
+    if [[ -z "$rock_file" || "$rock_file" == "null" ]]; then
+        info "  warning: $image_ref not in registry and no rock file found — using ref as-is"
+        echo "$image_ref"; return
+    fi
+
+    local abs_rock="$REPO_DIR/$rock_file"
+    if [[ ! -f "$abs_rock" ]]; then
+        info "  warning: rock file $abs_rock not found — using image ref as-is"
+        echo "$image_ref"; return
+    fi
+
+    info "  pushing $rock_file → $image_ref"
+    command -v skopeo >/dev/null 2>&1 || die "skopeo required to push rocks: apt install skopeo"
+    skopeo copy --dest-tls-verify=false "oci-archive:${abs_rock}" "docker://${image_ref}" >/dev/null 2>&1
+    echo "$image_ref"
+}
 
 # --- assemble pytest posargs from build-output.yaml --------------------------
 
@@ -52,7 +103,7 @@ for i in $(seq 0 $((charm_count - 1))); do
         args+=("--charm-file=$charm_file")
     done
 
-    # OCI image resources → --<resource-name>-image args (or --<resource>)
+    # OCI image resources → --<pytest_param>=<image> args (pytest_param overrides resource name)
     res_count=$(yq ".charms[$i].resources | length" "$OUTPUT" 2>/dev/null || echo 0)
     if [[ "$res_count" -gt 0 ]]; then
         mapfile -t res_names < <(yq ".charms[$i].resources | keys | .[]" "$OUTPUT" 2>/dev/null || true)
@@ -62,16 +113,31 @@ for i in $(seq 0 $((charm_count - 1))); do
             if [[ "$res_type" == "oci-image" ]]; then
                 image=$(yq ".charms[$i].resources.\"$res_name\".output.image // .charms[$i].resources.\"$res_name\".output.file" "$OUTPUT")
                 [[ -z "$image" || "$image" == "null" ]] && continue
-                args+=("--${res_name}=$image")
+                # find which rock backs this resource (for ensure_local_image fallback)
+                rock_ref=$(yq ".charms[$i].resources.\"$res_name\".rock // \"\"" "$OUTPUT" 2>/dev/null || true)
+                image=$(ensure_local_image "$image" "${rock_ref:-}")
+                # use pytest_param if specified, otherwise fall back to resource name
+                param=$(yq ".charms[$i].resources.\"$res_name\".pytest_param // \"\"" "$OUTPUT" 2>/dev/null || true)
+                [[ -z "$param" || "$param" == "null" ]] && param="$res_name"
+                args+=("--${param}=$image")
             fi
         done
     fi
 done
 
-info ""
-info "Running: tox -e integration -- ${args[*]:-}"
+# module filter → -k <module>; resolve tox env via test_modules mapping
+TOX_ENV="integration"
+if [[ -n "$MODULE" ]]; then
+    mapped_env=$(yq ".test_modules.\"$MODULE\" // \"\"" "$OUTPUT" 2>/dev/null || true)
+    if [[ -n "$mapped_env" && "$mapped_env" != "null" ]]; then
+        TOX_ENV="$mapped_env"
+    fi
+    args+=("-k" "$MODULE")
+fi
+
+info "Running: tox -e $TOX_ENV -- ${args[*]:-}"
 info ""
 
 # --- run integration tests ---------------------------------------------------
 
-(cd "$REPO_DIR" && tox -e integration -- "${args[@]:-}")
+(cd "$REPO_DIR" && tox -e "$TOX_ENV" -- "${args[@]:-}")

@@ -9,6 +9,12 @@
 #
 # Requires: yq >= 4 (https://github.com/mikefarah/yq)
 #           rockcraft / snapcraft / charmcraft (only the ones needed by the plan)
+#
+# OCI images (rocks):
+#   If a local OCI registry is reachable at localhost:32000 (microk8s default),
+#   rocks are automatically pushed there and build-output.yaml records the image
+#   reference (localhost:32000/<name>:<version>). Otherwise the .rock file path
+#   is recorded and rocks are used directly (suitable for machine charm testing).
 
 set -euo pipefail
 
@@ -26,13 +32,34 @@ command -v yq >/dev/null 2>&1 || die "yq is required. Install with: snap install
 [[ -f "$PLAN" ]] || die "build-plan.yaml not found in $REPO_DIR — run generate-plan first"
 
 # Find a single produced file matching a glob pattern inside a directory.
-# Fails if zero or more than one match is found.
 find_one() {
     local dir="$1" pattern="$2" label="$3"
     local -a files
     mapfile -t files < <(find "$dir" -maxdepth 1 -name "$pattern" | sort)
     [[ ${#files[@]} -eq 0 ]] && die "no $label file found in $dir matching '$pattern'"
     echo "${files[@]}"   # may be multiple (e.g. multi-base charms)
+}
+
+# Try to push a rock OCI archive to localhost:32000 (microk8s built-in registry).
+# Returns the image reference on stdout if pushed, empty string if unavailable.
+push_rock_to_local_registry() {
+    local rock_file="$1" rock_name="$2"
+    # Extract version from filename: <name>_<version>_<arch>.rock
+    local version
+    version=$(basename "$rock_file" .rock | sed "s/^${rock_name}_//" | sed 's/_[^_]*$//')
+    local ref="localhost:32000/${rock_name}:${version}"
+
+    if command -v skopeo >/dev/null 2>&1 && curl -sf --max-time 2 http://localhost:32000/v2/ >/dev/null 2>&1; then
+        info "  pushing to local registry: $ref"
+        if skopeo copy --dest-tls-verify=false \
+               "oci-archive:${rock_file}" "docker://${ref}" >/dev/null 2>&1; then
+            echo "$ref"
+            return
+        else
+            info "  warning: push to localhost:32000 failed — using file reference instead"
+        fi
+    fi
+    echo ""
 }
 
 # --- read plan ---------------------------------------------------------------
@@ -46,6 +73,9 @@ info "Plan: $rock_count rock(s), $snap_count snap(s), $charm_count charm(s)"
 # Start output file as a copy of the plan; we will add .output fields in-place
 cp "$PLAN" "$OUTPUT"
 
+# Track image references keyed by rock name (name → image ref or "")
+declare -A rock_images
+
 # --- build rocks -------------------------------------------------------------
 
 for i in $(seq 0 $((rock_count - 1))); do
@@ -57,16 +87,33 @@ for i in $(seq 0 $((rock_count - 1))); do
     info "Building rock: $name ($source)"
     command -v rockcraft >/dev/null 2>&1 || die "rockcraft not found (needed for rock '$name')"
 
-    (cd "$abs_dir" && rockcraft pack --verbosity brief)
+    rockcraft_file=$(yq ".rocks[$i].rockcraft_file // \"\"" "$PLAN")
+    if [[ -n "$rockcraft_file" && "$rockcraft_file" != "null" ]]; then
+        # Non-standard rockcraft file name — temporarily copy to rockcraft.yaml
+        cp "$REPO_DIR/$rockcraft_file" "$abs_dir/rockcraft.yaml"
+        (cd "$abs_dir" && ROCKCRAFT_ENABLE_EXPERIMENTAL_EXTENSIONS=True rockcraft pack --verbosity brief)
+        rm -f "$abs_dir/rockcraft.yaml"
+    else
+        (cd "$abs_dir" && ROCKCRAFT_ENABLE_EXPERIMENTAL_EXTENSIONS=True rockcraft pack --verbosity brief)
+    fi
 
-    # Find produced .rock file(s)
-    mapfile -t rock_files < <(find_one "$abs_dir" "*.rock" "rock")
-    # Use the first file (single-arch local builds produce one)
+    # Find produced .rock file — search by name prefix to avoid matching sibling rocks
+    mapfile -t rock_files < <(find "$abs_dir" -maxdepth 1 -name "${name}_*.rock" | sort)
+    [[ ${#rock_files[@]} -eq 0 ]] && die "no .rock file found matching '${name}_*.rock' in $abs_dir"
     rock_file="${rock_files[0]}"
     rel_rock_file="$(realpath --relative-to="$REPO_DIR" "$rock_file")"
 
     info "  produced: $rel_rock_file"
     yq -i ".rocks[$i].output.file = \"$rel_rock_file\"" "$OUTPUT"
+
+    # Try to push to local OCI registry for k8s testing
+    image_ref=$(push_rock_to_local_registry "$rock_file" "$name")
+    if [[ -n "$image_ref" ]]; then
+        yq -i ".rocks[$i].output.image = \"$image_ref\"" "$OUTPUT"
+        rock_images["$name"]="$image_ref"
+    else
+        rock_images["$name"]=""
+    fi
 done
 
 # --- build snaps -------------------------------------------------------------
@@ -119,7 +166,7 @@ for i in $(seq 0 $((charm_count - 1))); do
     files_yaml="${files_yaml%,}]"   # strip trailing comma
     yq -i ".charms[$i].output.files = $files_yaml" "$OUTPUT"
 
-    # Resolve resource outputs from their rock's output
+    # Resolve resource outputs: prefer image ref if pushed, fall back to file
     res_count=$(yq ".charms[$i].resources | length" "$PLAN" 2>/dev/null || echo 0)
     for j in $(seq 0 $((res_count - 1))); do
         res_name=$(yq ".charms[$i].resources | keys | .[$j]" "$PLAN")
@@ -127,10 +174,15 @@ for i in $(seq 0 $((charm_count - 1))); do
 
         if [[ "$res_type" == "oci-image" ]]; then
             rock_ref=$(yq ".charms[$i].resources.\"$res_name\".rock" "$PLAN")
-            # Find the rock's output in the plan
+            image_ref="${rock_images[$rock_ref]:-}"
             rock_file_out=$(yq ".rocks[] | select(.name == \"$rock_ref\") | .output.file" "$OUTPUT" 2>/dev/null || true)
+            # Always record the file path if available (used as fallback in fresh VMs)
             if [[ -n "$rock_file_out" && "$rock_file_out" != "null" ]]; then
                 yq -i ".charms[$i].resources.\"$res_name\".output.file = \"$rock_file_out\"" "$OUTPUT"
+            fi
+            # Prefer image ref if rock was pushed to a registry
+            if [[ -n "$image_ref" ]]; then
+                yq -i ".charms[$i].resources.\"$res_name\".output.image = \"$image_ref\"" "$OUTPUT"
             fi
         fi
     done

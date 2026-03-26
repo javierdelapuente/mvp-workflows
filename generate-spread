@@ -1,0 +1,192 @@
+#!/usr/bin/env bash
+# generate-spread - scaffolds spread.yaml and integration/task.yaml for a charm repo
+#
+# Usage: generate-spread [REPO_DIR]
+#   REPO_DIR  path to the repository root (default: current directory)
+#
+# Scaffold-once: if spread.yaml already exists, prints a notice and exits 0.
+#
+# Discovers test modules from tests/integration/test_*.py, writes a self-contained
+# spread.yaml (lxdvm + ci backends with inline scripts) and integration/task.yaml.
+#
+# Requires: bash 4+
+
+set -euo pipefail
+
+REPO_DIR="${1:-.}"
+REPO_DIR="$(realpath "$REPO_DIR")"
+
+die()  { echo "error: $*" >&2; exit 1; }
+info() { echo "$*"; }
+
+# --- check for existing spread.yaml ------------------------------------------
+
+if [[ -f "$REPO_DIR/spread.yaml" ]]; then
+    info "spread.yaml already exists in $REPO_DIR — not overwriting."
+    info "Edit it manually to add or remove test variants."
+    exit 0
+fi
+
+# --- discover project name ---------------------------------------------------
+
+project_name=""
+for f in charmcraft.yaml metadata.yaml; do
+    if [[ -f "$REPO_DIR/$f" ]]; then
+        candidate=$(grep -m1 '^name:' "$REPO_DIR/$f" 2>/dev/null | sed 's/^name:[[:space:]]*//' | tr -d '"' || true)
+        if [[ -n "$candidate" ]]; then
+            project_name="$candidate"
+            break
+        fi
+    fi
+done
+[[ -z "$project_name" ]] && project_name="$(basename "$REPO_DIR")"
+
+# --- discover test modules ---------------------------------------------------
+
+mapfile -t modules < <(
+    find "$REPO_DIR/tests/integration" -maxdepth 1 -name 'test_*.py' 2>/dev/null \
+    | sort \
+    | xargs -I{} basename {} .py
+)
+
+if [[ ${#modules[@]} -eq 0 ]]; then
+    die "No test_*.py files found in $REPO_DIR/tests/integration/"
+fi
+
+info "Discovered ${#modules[@]} test module(s): ${modules[*]}"
+
+# --- build variant environment block -----------------------------------------
+
+variants_block=""
+for mod in "${modules[@]}"; do
+    variants_block+="      MODULE/${mod}: ${mod}"$'\n'
+done
+# strip trailing newline
+variants_block="${variants_block%$'\n'}"
+
+# --- write spread.yaml -------------------------------------------------------
+
+cat > "$REPO_DIR/spread.yaml" <<SPREADYAML
+project: ${project_name}
+
+backends:
+  lxdvm:
+    type: adhoc
+    allocate: |
+      VM_NAME="spread-lxdvm-\${RANDOM}"
+      lxc launch --vm ubuntu:22.04 "\$VM_NAME" \\
+          -c limits.cpu=4 -c limits.memory=8GiB -d root,size=20GiB
+      while ! lxc exec "\$VM_NAME" -- true &>/dev/null; do sleep 0.5; done
+      lxc exec "\$VM_NAME" -- bash -c "
+          sed -i 's/^#\\\\?PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config
+          sed -i 's/^#\\\\?PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config
+          printf 'PermitRootLogin yes\nPasswordAuthentication yes\n' > /etc/ssh/sshd_config.d/60-cloudimg-settings.conf
+          echo root:\${SPREAD_PASSWORD} | chpasswd
+          systemctl restart ssh
+      "
+      ADDR=""
+      while [ -z "\$ADDR" ]; do
+          ADDR=\$(lxc ls -f csv | grep "^\${VM_NAME}" | cut -d, -f3 | cut -d' ' -f1)
+          sleep 0.5
+      done
+      ADDRESS "\$ADDR"
+    discard: |
+      instance=\$(lxc ls -f csv | grep ",\${SPREAD_SYSTEM_ADDRESS} " | cut -f1 -d,)
+      [ -n "\$instance" ] && lxc delete -f "\$instance" || true
+    prepare: |
+      snap wait system seed.loaded
+      snap refresh --hold || true
+    restore: |
+      rm -rf "\$SPREAD_PATH"
+      mkdir -p "\$SPREAD_PATH"
+    systems:
+      - ubuntu-22.04:
+          workers: 3
+
+  ci:
+    type: adhoc
+    allocate: |
+      if [ -z "\${CI:-}" ]; then
+          echo "The ci backend is intended for use in CI environments only." >&2
+          exit 1
+      fi
+      sudo sed -i 's/^#\\?PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config
+      sudo sed -i 's/^#\\?PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config
+      if [ -d /etc/ssh/sshd_config.d ]; then
+          printf 'PermitRootLogin yes\nPasswordAuthentication yes\n' \\
+              | sudo tee /etc/ssh/sshd_config.d/00-spread.conf >/dev/null
+      fi
+      sudo systemctl daemon-reload
+      sudo systemctl restart ssh
+      echo "root:\${SPREAD_PASSWORD}" | sudo chpasswd
+      ADDRESS localhost
+    discard: |
+      true
+    prepare: |
+      snap wait system seed.loaded || true
+    restore: |
+      true
+    systems:
+      - ubuntu-22.04:
+          workers: 1
+
+path: /root/project
+
+suites:
+  integration/:
+    summary: Integration tests
+    kill-timeout: 40m
+    warn-timeout: 10m
+    environment:
+${variants_block}
+    prepare: |
+      snap install concierge --classic 2>/dev/null || snap refresh concierge --classic 2>/dev/null || true
+      concierge prepare -c "\$SPREAD_PATH/concierge.yaml"
+      apt-get update -qq
+      apt-get install -y python3-pip python3-venv
+      pip3 install tox tox-uv
+SPREADYAML
+
+info "Written: $REPO_DIR/spread.yaml"
+
+# --- write integration/task.yaml (if not present) ----------------------------
+
+TASK_DIR="$REPO_DIR/integration/run"
+TASK_FILE="$TASK_DIR/task.yaml"
+
+if [[ -f "$TASK_FILE" ]]; then
+    info "integration/run/task.yaml already exists — not overwriting."
+else
+    mkdir -p "$TASK_DIR"
+    cat > "$TASK_FILE" <<'TASKYAML'
+summary: Run $MODULE integration test
+kill-timeout: 90m
+execute: |
+  set -euo pipefail
+  cd "$SPREAD_PATH"
+  mapfile -t pytest_args < <(python3 - <<'PYEOF'
+  import yaml, sys
+  d = yaml.safe_load(open('build-output.yaml'))
+  for c in d.get('charms', []):
+      for f in c.get('output', {}).get('files', []):
+          sys.stdout.write(f"--charm-file={f}\n")
+      for rname, rval in c.get('resources', {}).items():
+          img = rval.get('output', {}).get('image')
+          ref = img if img else rval.get('output', {}).get('file', '')
+          if ref:
+              sys.stdout.write(f"--{rname}={ref}\n")
+  PYEOF
+  )
+  tox -e integration -- "${pytest_args[@]}" -k "$MODULE"
+TASKYAML
+    info "Written: $TASK_FILE"
+fi
+
+info ""
+info "Done. Commit spread.yaml and integration/task.yaml to your repository."
+info ""
+info "Local usage (parallel):"
+info "  spread lxdvm:"
+info ""
+info "Single module locally (no spread needed):"
+info "  ./provision . && ./test . --module <module>"
