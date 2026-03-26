@@ -1,0 +1,39 @@
+name: Generate plan
+
+on:
+  workflow_call:
+    outputs:
+      plan:
+        description: "The generated build-plan.yaml contents (base64-encoded)"
+        value: ${{ jobs.generate-plan.outputs.plan }}
+
+jobs:
+  generate-plan:
+    name: Generate build plan
+    runs-on: ubuntu-latest
+    outputs:
+      plan: ${{ steps.plan.outputs.plan }}
+    steps:
+      - name: Checkout caller repository
+        uses: actions/checkout@v4
+
+      - name: Checkout mvp-workflows
+        uses: actions/checkout@v4
+        with:
+          repository: javierdelapuente/mvp-workflows
+          path: .mvp-workflows
+
+      - name: Install yq
+        run: sudo snap install yq
+
+      - name: Generate build plan
+        id: plan
+        run: |
+          .mvp-workflows/generate-plan .
+          echo "plan=$(base64 -w0 build-plan.yaml)" >> "$GITHUB_OUTPUT"
+
+      - name: Upload build-plan.yaml
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-plan
+          path: build-plan.yaml
