@@ -166,6 +166,12 @@ for i in $(seq 0 $((charm_count - 1))); do
     files_yaml="${files_yaml%,}]"   # strip trailing comma
     yq -i ".charms[$i].output.files = $files_yaml" "$OUTPUT"
 
+    # Copy extra_pytest_args from plan to output (used by test script)
+    extra_pytest_args=$(yq ".charms[$i].extra_pytest_args" "$PLAN" 2>/dev/null || true)
+    if [[ -n "$extra_pytest_args" && "$extra_pytest_args" != "null" ]]; then
+        yq -i ".charms[$i].extra_pytest_args = ${extra_pytest_args}" "$OUTPUT"
+    fi
+
     # Resolve resource outputs: prefer image ref if pushed, fall back to file
     res_count=$(yq ".charms[$i].resources | length" "$PLAN" 2>/dev/null || echo 0)
     for j in $(seq 0 $((res_count - 1))); do
