@@ -1,4 +1,4 @@
-name: Generate plan and build
+name: MVP integration tests
 
 on:
   workflow_call:
@@ -18,10 +18,16 @@ jobs:
       - name: Checkout caller repository
         uses: actions/checkout@v4
 
+      - name: Set mvp-workflows source
+        run: |
+          echo "MVW_REPO=${GITHUB_WORKFLOW_REF%%/.github/*}" >> "$GITHUB_ENV"
+          echo "MVW_REF=${GITHUB_WORKFLOW_REF##*@}" >> "$GITHUB_ENV"
+
       - name: Checkout mvp-workflows
         uses: actions/checkout@v4
         with:
-          repository: javierdelapuente/mvp-workflows
+          repository: ${{ env.MVW_REPO }}
+          ref: ${{ env.MVW_REF }}
           path: .mvp-workflows
 
       - name: Install yq
@@ -48,10 +54,16 @@ jobs:
       - name: Checkout caller repository
         uses: actions/checkout@v4
 
+      - name: Set mvp-workflows source
+        run: |
+          echo "MVW_REPO=${GITHUB_WORKFLOW_REF%%/.github/*}" >> "$GITHUB_ENV"
+          echo "MVW_REF=${GITHUB_WORKFLOW_REF##*@}" >> "$GITHUB_ENV"
+
       - name: Checkout mvp-workflows
         uses: actions/checkout@v4
         with:
-          repository: javierdelapuente/mvp-workflows
+          repository: ${{ env.MVW_REPO }}
+          ref: ${{ env.MVW_REF }}
           path: .mvp-workflows
 
       - name: Download build-plan.yaml
@@ -98,10 +110,16 @@ jobs:
       - name: Checkout caller repository
         uses: actions/checkout@v4
 
+      - name: Set mvp-workflows source
+        run: |
+          echo "MVW_REPO=${GITHUB_WORKFLOW_REF%%/.github/*}" >> "$GITHUB_ENV"
+          echo "MVW_REF=${GITHUB_WORKFLOW_REF##*@}" >> "$GITHUB_ENV"
+
       - name: Checkout mvp-workflows
         uses: actions/checkout@v4
         with:
-          repository: javierdelapuente/mvp-workflows
+          repository: ${{ env.MVW_REPO }}
+          ref: ${{ env.MVW_REF }}
           path: .mvp-workflows
 
       - name: Download build-plan.yaml
@@ -134,3 +152,4 @@ jobs:
 
       - name: Test
         run: .mvp-workflows/test .
+
