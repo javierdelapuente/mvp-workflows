@@ -128,6 +128,7 @@ jobs:
           sudo snap install --classic charmcraft &
           sudo snap install yq &
           pip install tox tox-uv &
+          sudo apt install -y skopeo &
           wait
 
       - name: Configure networking for LXD containers

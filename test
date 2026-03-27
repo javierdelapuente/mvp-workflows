@@ -15,6 +15,11 @@
 #   If a resource has output.image pointing to localhost:32000 but the image is
 #   not present there (e.g. inside a fresh spread VM), the script will push the
 #   rock file (output.file on the rock) to the registry before running tests.
+#
+# Extra pytest args:
+#   build-plan.yaml charm entries may specify extra_pytest_args as a YAML list
+#   of strings. These are appended verbatim to the pytest invocation, allowing
+#   per-charm customisation (e.g. --ignore=tests/integration/test_saml.py).
 
 set -euo pipefail
 
@@ -133,6 +138,15 @@ if [[ -n "$MODULE" ]]; then
         TOX_ENV="$mapped_env"
     fi
     args+=("-k" "$MODULE")
+fi
+
+# extra_pytest_args from build-output.yaml charm entries (applied to first charm)
+if [[ "$charm_count" -gt 0 ]]; then
+    extra_count=$(yq ".charms[0].extra_pytest_args | length" "$OUTPUT" 2>/dev/null || echo 0)
+    for k in $(seq 0 $((extra_count - 1))); do
+        extra_arg=$(yq ".charms[0].extra_pytest_args[$k]" "$OUTPUT")
+        [[ -n "$extra_arg" && "$extra_arg" != "null" ]] && args+=("$extra_arg")
+    done
 fi
 
 info "Running: tox -e $TOX_ENV -- ${args[*]:-}"
