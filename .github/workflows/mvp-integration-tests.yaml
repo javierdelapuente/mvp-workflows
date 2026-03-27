@@ -2,6 +2,11 @@ name: MVP integration tests
 
 on:
   workflow_call:
+    inputs:
+      mvp-workflows-ref:
+        description: "Ref of javierdelapuente/mvp-workflows to use"
+        type: string
+        default: main
     outputs:
       plan:
         description: "The generated build-plan.yaml contents (base64-encoded)"
@@ -18,17 +23,11 @@ jobs:
       - name: Checkout caller repository
         uses: actions/checkout@v4
 
-      - name: Set mvp-workflows source
-        run: |
-          WF_REF="${{ github.workflow_ref }}"
-          echo "MVW_REPO=${WF_REF%%/.github/*}" >> "$GITHUB_ENV"
-          echo "MVW_REF=${WF_REF##*@}" >> "$GITHUB_ENV"
-
       - name: Checkout mvp-workflows
         uses: actions/checkout@v4
         with:
-          repository: ${{ env.MVW_REPO }}
-          ref: ${{ env.MVW_REF }}
+          repository: javierdelapuente/mvp-workflows
+          ref: ${{ inputs.mvp-workflows-ref }}
           path: .mvp-workflows
 
       - name: Install yq
@@ -55,17 +54,11 @@ jobs:
       - name: Checkout caller repository
         uses: actions/checkout@v4
 
-      - name: Set mvp-workflows source
-        run: |
-          WF_REF="${{ github.workflow_ref }}"
-          echo "MVW_REPO=${WF_REF%%/.github/*}" >> "$GITHUB_ENV"
-          echo "MVW_REF=${WF_REF##*@}" >> "$GITHUB_ENV"
-
       - name: Checkout mvp-workflows
         uses: actions/checkout@v4
         with:
-          repository: ${{ env.MVW_REPO }}
-          ref: ${{ env.MVW_REF }}
+          repository: javierdelapuente/mvp-workflows
+          ref: ${{ inputs.mvp-workflows-ref }}
           path: .mvp-workflows
 
       - name: Download build-plan.yaml
@@ -112,17 +105,11 @@ jobs:
       - name: Checkout caller repository
         uses: actions/checkout@v4
 
-      - name: Set mvp-workflows source
-        run: |
-          WF_REF="${{ github.workflow_ref }}"
-          echo "MVW_REPO=${WF_REF%%/.github/*}" >> "$GITHUB_ENV"
-          echo "MVW_REF=${WF_REF##*@}" >> "$GITHUB_ENV"
-
       - name: Checkout mvp-workflows
         uses: actions/checkout@v4
         with:
-          repository: ${{ env.MVW_REPO }}
-          ref: ${{ env.MVW_REF }}
+          repository: javierdelapuente/mvp-workflows
+          ref: ${{ inputs.mvp-workflows-ref }}
           path: .mvp-workflows
 
       - name: Download build-plan.yaml
