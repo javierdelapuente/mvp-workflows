@@ -117,6 +117,7 @@ jobs:
       - name: Install tools
         run: |
           sudo snap install --classic concierge &
+          sudo snap install --classic charmcraft &
           sudo snap install yq &
           pip install tox tox-uv &
           wait
