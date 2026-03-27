@@ -20,8 +20,9 @@ jobs:
 
       - name: Set mvp-workflows source
         run: |
-          echo "MVW_REPO=${GITHUB_WORKFLOW_REF%%/.github/*}" >> "$GITHUB_ENV"
-          echo "MVW_REF=${GITHUB_WORKFLOW_REF##*@}" >> "$GITHUB_ENV"
+          WF_REF="${{ github.workflow_ref }}"
+          echo "MVW_REPO=${WF_REF%%/.github/*}" >> "$GITHUB_ENV"
+          echo "MVW_REF=${WF_REF##*@}" >> "$GITHUB_ENV"
 
       - name: Checkout mvp-workflows
         uses: actions/checkout@v4
@@ -56,8 +57,9 @@ jobs:
 
       - name: Set mvp-workflows source
         run: |
-          echo "MVW_REPO=${GITHUB_WORKFLOW_REF%%/.github/*}" >> "$GITHUB_ENV"
-          echo "MVW_REF=${GITHUB_WORKFLOW_REF##*@}" >> "$GITHUB_ENV"
+          WF_REF="${{ github.workflow_ref }}"
+          echo "MVW_REPO=${WF_REF%%/.github/*}" >> "$GITHUB_ENV"
+          echo "MVW_REF=${WF_REF##*@}" >> "$GITHUB_ENV"
 
       - name: Checkout mvp-workflows
         uses: actions/checkout@v4
@@ -112,8 +114,9 @@ jobs:
 
       - name: Set mvp-workflows source
         run: |
-          echo "MVW_REPO=${GITHUB_WORKFLOW_REF%%/.github/*}" >> "$GITHUB_ENV"
-          echo "MVW_REF=${GITHUB_WORKFLOW_REF##*@}" >> "$GITHUB_ENV"
+          WF_REF="${{ github.workflow_ref }}"
+          echo "MVW_REPO=${WF_REF%%/.github/*}" >> "$GITHUB_ENV"
+          echo "MVW_REF=${WF_REF##*@}" >> "$GITHUB_ENV"
 
       - name: Checkout mvp-workflows
         uses: actions/checkout@v4
@@ -152,4 +155,3 @@ jobs:
 
       - name: Test
         run: .mvp-workflows/test .
-
