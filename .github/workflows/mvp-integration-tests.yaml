@@ -138,8 +138,30 @@ jobs:
           sudo iptables -P FORWARD ACCEPT
           sudo lxc network set lxdbr0 ipv6.address none 2>/dev/null || true
 
+      - name: Start local OCI registry
+        run: docker run -d --restart=always -p 32000:5000 --name local-registry registry:2
+
       - name: Provision
         run: .mvp-workflows/provision .
+
+      - name: Configure microk8s local registry
+        run: |
+          # If microk8s is in use, configure containerd to trust localhost:32000 as
+          # an insecure registry so rocks pushed there are accessible to k8s pods.
+          if ! command -v microk8s >/dev/null 2>&1; then exit 0; fi
+          HOSTS_DIR=/var/snap/microk8s/current/args/certs.d/localhost:32000
+          sudo mkdir -p "$HOSTS_DIR"
+          printf 'server = "http://localhost:32000"\n\n[host."http://localhost:32000"]\n  capabilities = ["pull", "resolve"]\n' \
+            | sudo tee "$HOSTS_DIR/hosts.toml" > /dev/null
+          # Restart microk8s containerd to pick up the registry config
+          sudo snap restart microk8s
+          microk8s status --wait-ready --timeout=120
+          # Wait for juju controller pod to recover after microk8s restart
+          echo "Waiting for juju controller to recover..."
+          for i in $(seq 1 60); do
+            juju status -c concierge-microk8s 2>/dev/null && break || true
+            sleep 5
+          done
 
       - name: Test
         run: .mvp-workflows/test .
