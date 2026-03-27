@@ -122,6 +122,13 @@ jobs:
           pip install tox tox-uv &
           wait
 
+      - name: Configure networking for LXD containers
+        run: |
+          sudo sysctl net.ipv4.ip_forward=1
+          sudo iptables -F FORWARD
+          sudo iptables -P FORWARD ACCEPT
+          sudo lxc network set lxdbr0 ipv6.address none 2>/dev/null || true
+
       - name: Provision
         run: .mvp-workflows/provision .
 
