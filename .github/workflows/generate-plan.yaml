@@ -88,3 +88,29 @@ jobs:
             **/*.charm
             **/*.rock
           if-no-files-found: warn
+
+  provision:
+    name: Provision
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout caller repository
+        uses: actions/checkout@v4
+
+      - name: Checkout mvp-workflows
+        uses: actions/checkout@v4
+        with:
+          repository: javierdelapuente/mvp-workflows
+          path: .mvp-workflows
+
+      - name: Download build-plan.yaml
+        uses: actions/download-artifact@v4
+        with:
+          name: build-plan
+
+      - name: Install concierge
+        run: sudo snap install --classic concierge
+
+      - name: Provision
+        run: .mvp-workflows/provision .
