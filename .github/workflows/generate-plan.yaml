@@ -25,7 +25,7 @@ jobs:
           path: .mvp-workflows
 
       - name: Install yq
-        run: sudo apt-get install -y yq
+        run: sudo snap install yq
 
       - name: Generate build plan
         id: plan
@@ -42,7 +42,7 @@ jobs:
   build:
     name: Build
     needs: generate-plan
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
       - name: Checkout caller repository
@@ -61,7 +61,7 @@ jobs:
 
       - name: Set up LXD
         run: |
-          sudo snap refresh lxd --channel=latest/stable
+          sudo snap install lxd --channel=latest/stable
           sudo lxd waitready --timeout=60
           sudo lxd init --auto
           sudo lxc config set images.compression_algorithm none
