@@ -179,5 +179,11 @@ for i in $(seq 0 $((charm_count - 1))); do
     done
 done
 
+# Copy top-level extra_prepull_images from plan to output (used by provision step)
+extra_prepull_json=$(yq -o=json ".extra_prepull_images" "$PLAN" 2>/dev/null || true)
+if [[ -n "$extra_prepull_json" && "$extra_prepull_json" != "null" ]]; then
+    yq -i ".extra_prepull_images = $extra_prepull_json" "$OUTPUT"
+fi
+
 info ""
 info "Written: $OUTPUT"
