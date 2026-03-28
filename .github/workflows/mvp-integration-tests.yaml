@@ -154,21 +154,6 @@ jobs:
           sudo systemctl restart snap.microk8s.daemon-containerd.service
           sudo microk8s status --wait-ready --timeout=120
 
-      - name: Configure GHCR authentication in microk8s
-        if: ${{ github.token != '' }}
-        run: |
-          # Configure GHCR auth so image pulls from ghcr.io are authenticated,
-          # avoiding anonymous rate limits on shared GitHub Actions runner IPs.
-          if ! command -v microk8s >/dev/null 2>&1; then exit 0; fi
-          sudo tee -a /var/snap/microk8s/current/args/containerd-template.toml > /dev/null <<EOF
-
-          [plugins."io.containerd.grpc.v1.cri".registry.configs."ghcr.io".auth]
-          username = "${{ github.actor }}"
-          password = "${{ github.token }}"
-          EOF
-          sudo systemctl restart snap.microk8s.daemon-containerd.service
-          sudo microk8s status --wait-ready --timeout=120
-
       - name: Push rocks to local registry
         run: |
           if ! command -v microk8s >/dev/null 2>&1; then exit 0; fi
