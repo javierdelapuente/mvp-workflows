@@ -187,3 +187,8 @@ jobs:
 
       - name: Test
         run: .mvp-workflows/test .
+
+      - name: Setup tmate session
+        if: ${{ failure() && runner.debug }}
+        uses: mxschmitt/action-tmate@v3
+        timeout-minutes: 30
