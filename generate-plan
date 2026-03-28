@@ -21,6 +21,16 @@ info() { echo "$*"        >&2; }
 
 command -v yq >/dev/null 2>&1 || die "yq is required. Install with: snap install yq"
 
+# If a build-plan.yaml already exists (committed in the repo), use it as-is.
+# This allows repos to commit a custom build-plan.yaml with extra fields like
+# extra_pytest_args without having them discarded by auto-generation.
+if [[ -f "$OUTPUT" ]]; then
+    info "build-plan.yaml already exists — using committed version"
+    info ""
+    info "Written: $OUTPUT"
+    exit 0
+fi
+
 # Return path relative to REPO_DIR; normalise bare "." to "."
 rel() { realpath --relative-to="$REPO_DIR" "$1" || echo "."; }
 
