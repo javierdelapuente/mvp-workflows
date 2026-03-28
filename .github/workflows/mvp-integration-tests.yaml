@@ -174,16 +174,6 @@ jobs:
               sudo microk8s ctr images pull --plain-http "${image_ref}"
             fi
           done
-          # Pre-pull extra images declared in build-plan (e.g. dependency charm images)
-          # to avoid memory spikes from concurrent pulls during deployment.
-          prepull_count=$(yq '.extra_prepull_images | length' build-output.yaml 2>/dev/null || echo 0)
-          for i in $(seq 0 $((prepull_count - 1))); do
-            image=$(yq ".extra_prepull_images[$i]" build-output.yaml 2>/dev/null || true)
-            if [[ -n "$image" && "$image" != "null" ]]; then
-              echo "  pre-pulling dependency image: $image"
-              sudo microk8s ctr images pull "$image" || echo "  warning: pre-pull of $image failed (non-fatal)"
-            fi
-          done
 
       - name: Test
         run: .mvp-workflows/test .
