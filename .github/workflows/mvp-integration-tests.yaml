@@ -170,6 +170,8 @@ jobs:
             if [[ -n "$rock_file" && "$rock_file" != "null" && -n "$image_ref" && "$image_ref" != "null" ]]; then
               echo "  pushing $rock_file → $image_ref"
               skopeo copy --dest-tls-verify=false "oci-archive:${rock_file}" "docker://${image_ref}"
+              echo "  pre-pulling $image_ref into microk8s containerd cache"
+              sudo microk8s ctr images pull --plain-http "${image_ref}"
             fi
           done
 
