@@ -138,9 +138,6 @@ jobs:
           sudo iptables -P FORWARD ACCEPT
           sudo lxc network set lxdbr0 ipv6.address none 2>/dev/null || true
 
-      - name: Start local OCI registry
-        run: docker run -d --restart=always -p 32000:5000 --name local-registry registry:2
-
       - name: Provision
         run: .mvp-workflows/provision .
 
@@ -156,6 +153,25 @@ jobs:
           # Restart only containerd to pick up the registry config
           sudo systemctl restart snap.microk8s.daemon-containerd.service
           sudo microk8s status --wait-ready --timeout=120
+
+      - name: Push rocks to local registry
+        run: |
+          if ! command -v microk8s >/dev/null 2>&1; then exit 0; fi
+          # Wait for microk8s registry to be ready
+          for i in $(seq 1 30); do
+            curl -sf --max-time 3 http://localhost:32000/v2/ >/dev/null 2>&1 && break || true
+            sleep 5
+          done
+          # Push all rocks from build-output.yaml to localhost:32000
+          rock_count=$(yq '.rocks | length' build-output.yaml 2>/dev/null || echo 0)
+          for i in $(seq 0 $((rock_count - 1))); do
+            rock_file=$(yq ".rocks[$i].output.file" build-output.yaml 2>/dev/null || true)
+            image_ref=$(yq ".rocks[$i].output.image" build-output.yaml 2>/dev/null || true)
+            if [[ -n "$rock_file" && "$rock_file" != "null" && -n "$image_ref" && "$image_ref" != "null" ]]; then
+              echo "  pushing $rock_file → $image_ref"
+              skopeo copy --dest-tls-verify=false "oci-archive:${rock_file}" "docker://${image_ref}"
+            fi
+          done
 
       - name: Test
         run: .mvp-workflows/test .

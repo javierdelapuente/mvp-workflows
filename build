@@ -40,28 +40,6 @@ find_one() {
     echo "${files[@]}"   # may be multiple (e.g. multi-base charms)
 }
 
-# Try to push a rock OCI archive to localhost:32000 (microk8s built-in registry).
-# Returns the image reference on stdout if pushed, empty string if unavailable.
-push_rock_to_local_registry() {
-    local rock_file="$1" rock_name="$2"
-    # Extract version from filename: <name>_<version>_<arch>.rock
-    local version
-    version=$(basename "$rock_file" .rock | sed "s/^${rock_name}_//" | sed 's/_[^_]*$//')
-    local ref="localhost:32000/${rock_name}:${version}"
-
-    if command -v skopeo >/dev/null 2>&1 && curl -sf --max-time 2 http://localhost:32000/v2/ >/dev/null 2>&1; then
-        info "  pushing to local registry: $ref"
-        if skopeo copy --dest-tls-verify=false \
-               "oci-archive:${rock_file}" "docker://${ref}" >/dev/null 2>&1; then
-            echo "$ref"
-            return
-        else
-            info "  warning: push to localhost:32000 failed — using file reference instead"
-        fi
-    fi
-    echo ""
-}
-
 # --- read plan ---------------------------------------------------------------
 
 rock_count=$(yq  '.rocks  | length' "$PLAN" 2>/dev/null || echo 0)
@@ -106,14 +84,21 @@ for i in $(seq 0 $((rock_count - 1))); do
     info "  produced: $rel_rock_file"
     yq -i ".rocks[$i].output.file = \"$rel_rock_file\"" "$OUTPUT"
 
-    # Try to push to local OCI registry for k8s testing
-    image_ref=$(push_rock_to_local_registry "$rock_file" "$name")
-    if [[ -n "$image_ref" ]]; then
-        yq -i ".rocks[$i].output.image = \"$image_ref\"" "$OUTPUT"
-        rock_images["$name"]="$image_ref"
-    else
-        rock_images["$name"]=""
+    # Always record the localhost:32000 image ref so the test step can push the
+    # rock there before running tests (even if the registry isn't available here).
+    version=$(basename "$rock_file" .rock | sed "s/^${name}_//" | sed 's/_[^_]*$//')
+    image_ref="localhost:32000/${name}:${version}"
+    # Try to push now if a local registry is already running (e.g. spread VM)
+    if command -v skopeo >/dev/null 2>&1 && curl -sf --max-time 2 http://localhost:32000/v2/ >/dev/null 2>&1; then
+        if skopeo copy --dest-tls-verify=false \
+               "oci-archive:${rock_file}" "docker://${image_ref}" >/dev/null 2>&1; then
+            info "  pushed to local registry: $image_ref"
+        else
+            info "  warning: push to localhost:32000 failed — test step will push"
+        fi
     fi
+    yq -i ".rocks[$i].output.image = \"$image_ref\"" "$OUTPUT"
+    rock_images["$name"]="$image_ref"
 done
 
 # --- build snaps -------------------------------------------------------------
