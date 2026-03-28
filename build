@@ -167,9 +167,9 @@ for i in $(seq 0 $((charm_count - 1))); do
     yq -i ".charms[$i].output.files = $files_yaml" "$OUTPUT"
 
     # Copy extra_pytest_args from plan to output (used by test script)
-    extra_pytest_args=$(yq ".charms[$i].extra_pytest_args" "$PLAN" 2>/dev/null || true)
-    if [[ -n "$extra_pytest_args" && "$extra_pytest_args" != "null" ]]; then
-        yq -i ".charms[$i].extra_pytest_args = ${extra_pytest_args}" "$OUTPUT"
+    extra_pytest_args_json=$(yq -o=json ".charms[$i].extra_pytest_args" "$PLAN" 2>/dev/null || true)
+    if [[ -n "$extra_pytest_args_json" && "$extra_pytest_args_json" != "null" ]]; then
+        yq -i ".charms[$i].extra_pytest_args = $extra_pytest_args_json" "$OUTPUT"
     fi
 
     # Resolve resource outputs: prefer image ref if pushed, fall back to file
