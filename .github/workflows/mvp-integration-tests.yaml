@@ -97,80 +97,91 @@ jobs:
           if-no-files-found: warn
 
   discover-tests:
-    name: Discover test modules
+    name: Discover spread tasks
     needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
-      modules: ${{ steps.discover.outputs.modules }}
+      tasks: ${{ steps.list.outputs.tasks }}
     steps:
       - name: Checkout caller repository
         uses: actions/checkout@v4
+
+      - name: Checkout mvp-workflows
+        uses: actions/checkout@v4
+        with:
+          repository: javierdelapuente/mvp-workflows
+          ref: ${{ inputs.mvp-workflows-ref }}
+          path: .mvp-workflows
 
       - name: Download build-output.yaml
         uses: actions/download-artifact@v4
         with:
           name: build-output
 
-      - name: Install yq
-        run: sudo snap install yq
+      - name: Install spread and yq
+        run: sudo snap install spread && sudo snap install yq
 
-      - name: Discover test modules
-        id: discover
+      - name: Generate spread.yaml if needed
+        run: .mvp-workflows/generate-spread .
+
+      - name: List spread tasks
+        id: list
         run: |
-          # Collect --ignore paths from extra_pytest_args
-          ignored=()
-          extra_count=$(yq '.charms[0].extra_pytest_args | length' build-output.yaml 2>/dev/null || echo 0)
-          for i in $(seq 0 $((extra_count - 1))); do
-            arg=$(yq ".charms[0].extra_pytest_args[$i]" build-output.yaml 2>/dev/null || true)
-            if [[ "$arg" == --ignore=* ]]; then
-              ignored+=("${arg#--ignore=}")
-            fi
-          done
+          # List all tasks for the ci backend
+          all_tasks=$(spread -list ci: 2>/dev/null || true)
 
-          # Discover test_*.py files
-          modules=()
-          for f in tests/integration/test_*.py; do
-            [ -f "$f" ] || continue
-            basename=$(basename "$f")
-            # Check if this file is in the ignore list
+          # Collect --ignore patterns from extra_pytest_args to exclude modules
+          ignored=()
+          if [ -f build-output.yaml ]; then
+            extra_count=$(yq '.charms[0].extra_pytest_args | length' build-output.yaml 2>/dev/null || echo 0)
+            for i in $(seq 0 $((extra_count - 1))); do
+              arg=$(yq ".charms[0].extra_pytest_args[$i]" build-output.yaml 2>/dev/null || true)
+              if [[ "$arg" == --ignore=* ]]; then
+                # Extract module name from path (e.g. tests/integration/test_saml.py → test_saml)
+                basename=$(basename "${arg#--ignore=}" .py)
+                ignored+=("$basename")
+              fi
+            done
+          fi
+
+          # Filter out ignored modules
+          filtered=()
+          while IFS= read -r task; do
+            [ -z "$task" ] && continue
             skip=false
             for ign in "${ignored[@]}"; do
-              ign_base=$(basename "$ign")
-              if [[ "$basename" == "$ign_base" || "$f" == "$ign" ]]; then
+              if [[ "$task" == *":$ign" ]]; then
+                echo "  excluding: $task (--ignore match: $ign)"
                 skip=true
                 break
               fi
             done
             if [[ "$skip" == "false" ]]; then
-              modules+=("${basename%.py}")
+              filtered+=("$task")
             fi
-          done
-
-          # Also check for ignored directories (e.g. --ignore=tests/unit_harness)
-          # These are already handled above since we only look at test_*.py files
-
-          if [[ ${#modules[@]} -eq 0 ]]; then
-            echo "No test modules found!" >&2
-            echo 'modules=[]' >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
+          done <<< "$all_tasks"
 
           # Output as JSON array
-          json=$(printf '%s\n' "${modules[@]}" | jq -R . | jq -sc .)
-          echo "Discovered modules: $json"
-          echo "modules=$json" >> "$GITHUB_OUTPUT"
+          if [[ ${#filtered[@]} -eq 0 ]]; then
+            echo "No tasks to run!"
+            echo 'tasks=[]' >> "$GITHUB_OUTPUT"
+          else
+            json=$(printf '%s\n' "${filtered[@]}" | jq -R . | jq -sc .)
+            echo "Discovered spread tasks: $json"
+            echo "tasks=$json" >> "$GITHUB_OUTPUT"
+          fi
 
   test:
-    name: "test (${{ matrix.module }})"
+    name: "${{ matrix.task }}"
     needs: [build, discover-tests]
-    if: ${{ needs.discover-tests.outputs.modules != '[]' }}
+    if: ${{ needs.discover-tests.outputs.tasks != '[]' }}
     runs-on: ubuntu-latest
     timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
-        module: ${{ fromJson(needs.discover-tests.outputs.modules) }}
+        task: ${{ fromJson(needs.discover-tests.outputs.tasks) }}
     steps:
       - name: Checkout caller repository
         uses: actions/checkout@v4
@@ -192,14 +203,8 @@ jobs:
         with:
           name: build-output
 
-      - name: Install tools
-        run: |
-          sudo snap install --classic concierge &
-          sudo snap install --classic charmcraft &
-          sudo snap install yq &
-          pip install tox tox-uv &
-          sudo apt install -y skopeo &
-          wait
+      - name: Install spread
+        run: sudo snap install spread
 
       - name: Configure networking for LXD containers
         run: |
@@ -208,40 +213,16 @@ jobs:
           sudo iptables -P FORWARD ACCEPT
           sudo lxc network set lxdbr0 ipv6.address none 2>/dev/null || true
 
-      - name: Provision
-        run: .mvp-workflows/provision .
+      - name: Generate spread.yaml if needed
+        run: .mvp-workflows/generate-spread .
 
-      - name: Configure microk8s local registry
-        run: |
-          if ! command -v microk8s >/dev/null 2>&1; then exit 0; fi
-          HOSTS_DIR=/var/snap/microk8s/current/args/certs.d/localhost:32000
-          sudo mkdir -p "$HOSTS_DIR"
-          printf 'server = "http://localhost:32000"\n\n[host."http://localhost:32000"]\n  capabilities = ["pull", "resolve"]\n' \
-            | sudo tee "$HOSTS_DIR/hosts.toml" > /dev/null
-          sudo systemctl restart snap.microk8s.daemon-containerd.service
-          sudo microk8s status --wait-ready --timeout=120
+      - name: Run spread task
+        run: spread ${{ matrix.task }}
 
-      - name: Push rocks to local registry
-        run: |
-          if ! command -v microk8s >/dev/null 2>&1; then exit 0; fi
-          for i in $(seq 1 30); do
-            curl -sf --max-time 3 http://localhost:32000/v2/ >/dev/null 2>&1 && break || true
-            sleep 5
-          done
-          rock_count=$(yq '.rocks | length' build-output.yaml 2>/dev/null || echo 0)
-          for i in $(seq 0 $((rock_count - 1))); do
-            rock_file=$(yq ".rocks[$i].output.file" build-output.yaml 2>/dev/null || true)
-            image_ref=$(yq ".rocks[$i].output.image" build-output.yaml 2>/dev/null || true)
-            if [[ -n "$rock_file" && "$rock_file" != "null" && -n "$image_ref" && "$image_ref" != "null" ]]; then
-              echo "  pushing $rock_file → $image_ref"
-              skopeo copy --dest-tls-verify=false "oci-archive:${rock_file}" "docker://${image_ref}"
-              echo "  pre-pulling $image_ref into microk8s containerd cache"
-              sudo microk8s ctr images pull --plain-http "${image_ref}"
-            fi
-          done
-
-      - name: Test
-        run: .mvp-workflows/test . --module ${{ matrix.module }}
+      - name: Setup tmate session
+        if: ${{ failure() && runner.debug }}
+        uses: mxschmitt/action-tmate@v3
+        timeout-minutes: 30
 
       - name: Setup tmate session
         if: ${{ failure() && runner.debug }}

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# generate-spread - scaffolds spread.yaml and integration/task.yaml for a charm repo
+# generate-spread - scaffolds spread.yaml and integration/run/task.yaml for a charm repo
 #
 # Usage: generate-spread [REPO_DIR]
 #   REPO_DIR  path to the repository root (default: current directory)
@@ -7,7 +7,10 @@
 # Scaffold-once: if spread.yaml already exists, prints a notice and exits 0.
 #
 # Discovers test modules from tests/integration/test_*.py, writes a self-contained
-# spread.yaml (lxdvm + ci backends with inline scripts) and integration/task.yaml.
+# spread.yaml (lxdvm + ci backends) and integration/run/task.yaml.
+#
+# The generated spread tasks call the mvp-workflows provision and test scripts,
+# keeping spread as the task runner and parallelizer.
 #
 # Requires: bash 4+
 
@@ -66,7 +69,7 @@ variants_block="${variants_block%$'\n'}"
 
 # --- write spread.yaml -------------------------------------------------------
 
-cat > "$REPO_DIR/spread.yaml" <<SPREADYAML
+cat > "$REPO_DIR/spread.yaml" << SPREADYAML
 project: ${project_name}
 
 backends:
@@ -135,21 +138,52 @@ path: /root/project
 suites:
   integration/:
     summary: Integration tests
-    kill-timeout: 40m
+    kill-timeout: 90m
     warn-timeout: 10m
     environment:
 ${variants_block}
     prepare: |
-      snap install concierge --classic 2>/dev/null || snap refresh concierge --classic 2>/dev/null || true
-      concierge prepare -c "\$SPREAD_PATH/concierge.yaml"
-      apt-get update -qq
-      apt-get install -y python3-pip python3-venv
+      cd "\$SPREAD_PATH"
+
+      # Install tools
+      snap install yq
+      snap install --classic concierge
+      apt-get update -qq && apt-get install -y python3-pip python3-venv skopeo
       pip3 install tox tox-uv
+
+      # Provision (juju + microk8s/lxd via concierge)
+      .mvp-workflows/provision .
+
+      # Configure microk8s local registry and push rocks (if applicable)
+      if command -v microk8s >/dev/null 2>&1; then
+        HOSTS_DIR=/var/snap/microk8s/current/args/certs.d/localhost:32000
+        mkdir -p "\$HOSTS_DIR"
+        printf 'server = "http://localhost:32000"\n\n[host."http://localhost:32000"]\n  capabilities = ["pull", "resolve"]\n' \\
+          > "\$HOSTS_DIR/hosts.toml"
+        systemctl restart snap.microk8s.daemon-containerd.service
+        microk8s status --wait-ready --timeout=120
+        # Wait for registry
+        for i in \$(seq 1 30); do
+          curl -sf --max-time 3 http://localhost:32000/v2/ >/dev/null 2>&1 && break || true
+          sleep 5
+        done
+        # Push all rocks to localhost:32000
+        rock_count=\$(yq '.rocks | length' "\$SPREAD_PATH/build-output.yaml" 2>/dev/null || echo 0)
+        for i in \$(seq 0 \$((rock_count - 1))); do
+          rock_file=\$(yq ".rocks[\$i].output.file" "\$SPREAD_PATH/build-output.yaml" 2>/dev/null || true)
+          image_ref=\$(yq ".rocks[\$i].output.image" "\$SPREAD_PATH/build-output.yaml" 2>/dev/null || true)
+          if [[ -n "\$rock_file" && "\$rock_file" != "null" && -n "\$image_ref" && "\$image_ref" != "null" ]]; then
+            echo "  pushing \$rock_file -> \$image_ref"
+            skopeo copy --dest-tls-verify=false "oci-archive:\${SPREAD_PATH}/\${rock_file}" "docker://\${image_ref}"
+            microk8s ctr images pull --plain-http "\${image_ref}"
+          fi
+        done
+      fi
 SPREADYAML
 
 info "Written: $REPO_DIR/spread.yaml"
 
-# --- write integration/task.yaml (if not present) ----------------------------
+# --- write integration/run/task.yaml (if not present) ------------------------
 
 TASK_DIR="$REPO_DIR/integration/run"
 TASK_FILE="$TASK_DIR/task.yaml"
@@ -158,35 +192,25 @@ if [[ -f "$TASK_FILE" ]]; then
     info "integration/run/task.yaml already exists — not overwriting."
 else
     mkdir -p "$TASK_DIR"
-    cat > "$TASK_FILE" <<'TASKYAML'
+    cat > "$TASK_FILE" << 'TASKYAML'
 summary: Run $MODULE integration test
 kill-timeout: 90m
 execute: |
   set -euo pipefail
   cd "$SPREAD_PATH"
-  mapfile -t pytest_args < <(python3 - <<'PYEOF'
-  import yaml, sys
-  d = yaml.safe_load(open('build-output.yaml'))
-  for c in d.get('charms', []):
-      for f in c.get('output', {}).get('files', []):
-          sys.stdout.write(f"--charm-file={f}\n")
-      for rname, rval in c.get('resources', {}).items():
-          img = rval.get('output', {}).get('image')
-          ref = img if img else rval.get('output', {}).get('file', '')
-          if ref:
-              sys.stdout.write(f"--{rname}={ref}\n")
-  PYEOF
-  )
-  tox -e integration -- "${pytest_args[@]}" -k "$MODULE"
+  .mvp-workflows/test . --module "$MODULE"
 TASKYAML
     info "Written: $TASK_FILE"
 fi
 
 info ""
-info "Done. Commit spread.yaml and integration/task.yaml to your repository."
+info "Done. Commit spread.yaml and integration/run/task.yaml to your repository."
 info ""
-info "Local usage (parallel):"
+info "Local usage (parallel across LXD VMs):"
 info "  spread lxdvm:"
+info ""
+info "CI usage (one task per GitHub Actions runner):"
+info "  spread ci:integration/run  (with MODULE variant)"
 info ""
 info "Single module locally (no spread needed):"
 info "  ./provision . && ./test . --module <module>"
