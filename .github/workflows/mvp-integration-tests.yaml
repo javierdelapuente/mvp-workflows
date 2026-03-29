@@ -213,6 +213,22 @@ jobs:
           sudo iptables -P FORWARD ACCEPT
           sudo lxc network set lxdbr0 ipv6.address none 2>/dev/null || true
 
+      - name: Configure SSH for spread ci backend
+        run: |
+          # spread ci backend SSHes into localhost as root.
+          # Enable root login and set a known password before spread runs.
+          SPREAD_PASSWORD=$(openssl rand -base64 16)
+          echo "SPREAD_PASSWORD=$SPREAD_PASSWORD" >> "$GITHUB_ENV"
+          sudo sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config
+          sudo sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config
+          if [ -d /etc/ssh/sshd_config.d ]; then
+            printf 'PermitRootLogin yes\nPasswordAuthentication yes\n' \
+              | sudo tee /etc/ssh/sshd_config.d/00-spread.conf >/dev/null
+          fi
+          sudo systemctl daemon-reload
+          sudo systemctl restart ssh
+          echo "root:$SPREAD_PASSWORD" | sudo chpasswd
+
       - name: Generate spread.yaml if needed
         run: .mvp-workflows/generate-spread .
 

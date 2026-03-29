@@ -109,19 +109,11 @@ backends:
   ci:
     type: adhoc
     allocate: |
+      # SSH is pre-configured by the workflow step before spread runs.
       if [ -z "\${CI:-}" ]; then
           echo "The ci backend is intended for use in CI environments only." >&2
           exit 1
       fi
-      sudo sed -i 's/^#\\?PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config
-      sudo sed -i 's/^#\\?PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config
-      if [ -d /etc/ssh/sshd_config.d ]; then
-          printf 'PermitRootLogin yes\nPasswordAuthentication yes\n' \\
-              | sudo tee /etc/ssh/sshd_config.d/00-spread.conf >/dev/null
-      fi
-      sudo systemctl daemon-reload
-      sudo systemctl restart ssh
-      echo "root:\${SPREAD_PASSWORD}" | sudo chpasswd
       ADDRESS localhost
     discard: |
       true
