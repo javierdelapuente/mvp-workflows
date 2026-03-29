@@ -130,14 +130,27 @@ for i in $(seq 0 $((charm_count - 1))); do
     fi
 done
 
-# module filter → -k <module>; resolve tox env via test_modules mapping
+# module filter → run specific test file; resolve tox env via test_modules mapping
 TOX_ENV="integration"
 if [[ -n "$MODULE" ]]; then
     mapped_env=$(yq ".test_modules.\"$MODULE\" // \"\"" "$OUTPUT" 2>/dev/null || true)
     if [[ -n "$mapped_env" && "$mapped_env" != "null" ]]; then
         TOX_ENV="$mapped_env"
     fi
-    args+=("-k" "$MODULE")
+    # Find the actual test file matching this module name
+    module_file=""
+    for candidate in "tests/integration/${MODULE}.py" "tests/integration/${MODULE}"; do
+        if [[ -f "$REPO_DIR/$candidate" ]]; then
+            module_file="$candidate"
+            break
+        fi
+    done
+    if [[ -n "$module_file" ]]; then
+        args+=("$module_file")
+    else
+        # Fall back to -k filter if file not found
+        args+=("-k" "$MODULE")
+    fi
 fi
 
 # extra_pytest_args from build-output.yaml charm entries (applied to first charm)

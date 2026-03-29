@@ -96,11 +96,81 @@ jobs:
             **/*.rock
           if-no-files-found: warn
 
-  provision-and-test:
-    name: Integration tests
+  discover-tests:
+    name: Discover test modules
     needs: build
     runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      modules: ${{ steps.discover.outputs.modules }}
+    steps:
+      - name: Checkout caller repository
+        uses: actions/checkout@v4
+
+      - name: Download build-output.yaml
+        uses: actions/download-artifact@v4
+        with:
+          name: build-output
+
+      - name: Install yq
+        run: sudo snap install yq
+
+      - name: Discover test modules
+        id: discover
+        run: |
+          # Collect --ignore paths from extra_pytest_args
+          ignored=()
+          extra_count=$(yq '.charms[0].extra_pytest_args | length' build-output.yaml 2>/dev/null || echo 0)
+          for i in $(seq 0 $((extra_count - 1))); do
+            arg=$(yq ".charms[0].extra_pytest_args[$i]" build-output.yaml 2>/dev/null || true)
+            if [[ "$arg" == --ignore=* ]]; then
+              ignored+=("${arg#--ignore=}")
+            fi
+          done
+
+          # Discover test_*.py files
+          modules=()
+          for f in tests/integration/test_*.py; do
+            [ -f "$f" ] || continue
+            basename=$(basename "$f")
+            # Check if this file is in the ignore list
+            skip=false
+            for ign in "${ignored[@]}"; do
+              ign_base=$(basename "$ign")
+              if [[ "$basename" == "$ign_base" || "$f" == "$ign" ]]; then
+                skip=true
+                break
+              fi
+            done
+            if [[ "$skip" == "false" ]]; then
+              modules+=("${basename%.py}")
+            fi
+          done
+
+          # Also check for ignored directories (e.g. --ignore=tests/unit_harness)
+          # These are already handled above since we only look at test_*.py files
+
+          if [[ ${#modules[@]} -eq 0 ]]; then
+            echo "No test modules found!" >&2
+            echo 'modules=[]' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Output as JSON array
+          json=$(printf '%s\n' "${modules[@]}" | jq -R . | jq -sc .)
+          echo "Discovered modules: $json"
+          echo "modules=$json" >> "$GITHUB_OUTPUT"
+
+  test:
+    name: "test (${{ matrix.module }})"
+    needs: [build, discover-tests]
+    if: ${{ needs.discover-tests.outputs.modules != '[]' }}
+    runs-on: ubuntu-latest
     timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        module: ${{ fromJson(needs.discover-tests.outputs.modules) }}
     steps:
       - name: Checkout caller repository
         uses: actions/checkout@v4
@@ -143,26 +213,21 @@ jobs:
 
       - name: Configure microk8s local registry
         run: |
-          # If microk8s is in use, configure containerd to trust localhost:32000 as
-          # an insecure registry so rocks pushed there are accessible to k8s pods.
           if ! command -v microk8s >/dev/null 2>&1; then exit 0; fi
           HOSTS_DIR=/var/snap/microk8s/current/args/certs.d/localhost:32000
           sudo mkdir -p "$HOSTS_DIR"
           printf 'server = "http://localhost:32000"\n\n[host."http://localhost:32000"]\n  capabilities = ["pull", "resolve"]\n' \
             | sudo tee "$HOSTS_DIR/hosts.toml" > /dev/null
-          # Restart only containerd to pick up the registry config
           sudo systemctl restart snap.microk8s.daemon-containerd.service
           sudo microk8s status --wait-ready --timeout=120
 
       - name: Push rocks to local registry
         run: |
           if ! command -v microk8s >/dev/null 2>&1; then exit 0; fi
-          # Wait for microk8s registry to be ready
           for i in $(seq 1 30); do
             curl -sf --max-time 3 http://localhost:32000/v2/ >/dev/null 2>&1 && break || true
             sleep 5
           done
-          # Push all rocks from build-output.yaml to localhost:32000
           rock_count=$(yq '.rocks | length' build-output.yaml 2>/dev/null || echo 0)
           for i in $(seq 0 $((rock_count - 1))); do
             rock_file=$(yq ".rocks[$i].output.file" build-output.yaml 2>/dev/null || true)
@@ -176,7 +241,7 @@ jobs:
           done
 
       - name: Test
-        run: .mvp-workflows/test .
+        run: .mvp-workflows/test . --module ${{ matrix.module }}
 
       - name: Setup tmate session
         if: ${{ failure() && runner.debug }}
